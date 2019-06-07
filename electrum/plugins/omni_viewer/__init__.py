@@ -1,5 +1,5 @@
 from electrum.i18n import _
-from .qt import OmniCoreRPC
+from .omni import OmniCoreRPC
 
 fullname = _('Omni layer transaction viewer')
 description = ' '.join([
