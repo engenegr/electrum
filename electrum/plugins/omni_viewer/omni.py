@@ -16,12 +16,12 @@ class OmniCoreRPC():
         self.url = url
         self.user = username
         self.pwd = password
-        self.RequestTimeout = 5
+        self.RequestTimeout = 30
 
     def make_aiohttp_session(self, headers=None, timeout=None):
         # TODO: consider SSL sessions
         if headers is None:
-            headers = {'content-type': "application/json", 'cache-control': "no-cache"}
+            headers = {'content-type': "application/json"}
         if timeout is None:
             timeout = aiohttp.ClientTimeout(total=self.RequestTimeout)
         elif isinstance(timeout, (int, float)):
@@ -43,8 +43,8 @@ class OmniCoreRPC():
                 async with session.post(self.url, data = payload) as response:
                     response.raise_for_status()
                     # set content_type to None to disable checking MIME type
-                    await session.close()
-                    return await response.json(content_type=None)
+                    #await session.close()
+                    return await response.json(content_type='application/json')
             except concurrent.futures._base.TimeoutError:
                 await session.close()
                 return {'error': 'timeout'}
@@ -54,10 +54,11 @@ class OmniCoreRPC():
                     return {'error': 'unauthorized'}
 
 
-    def make_async_call(self, method=None, params=None):
-        loop = asyncio.get_event_loop()
-        response = asyncio.run_coroutine_threadsafe(self.get_response(method=method, params=params), loop)
-        return response.result()
+    def make_async_call(self, method=None, params=None, loop=None):
+        if not loop:
+            loop = asyncio.get_event_loop()
+        fut = asyncio.run_coroutine_threadsafe(self.get_response(method=method, params=params), loop)
+        return fut.result()
 
     def is_connected(self):
         result = self.check()

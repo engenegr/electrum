@@ -27,15 +27,17 @@ import asyncio
 import aiohttp
 import logging
 import concurrent
+import codecs
 from xmlrpc.client import ServerProxy
 
-from PyQt5.QtCore import QRegExp, QObject, pyqtSignal
+from PyQt5.QtCore import QRegExp, QObject, QThread, pyqtSignal, QAbstractTableModel, QVariant
 from PyQt5.QtGui import QRegExpValidator
-from PyQt5.QtWidgets import QLabel, QPushButton, QVBoxLayout, QLineEdit, QGridLayout
+from PyQt5.QtWidgets import QLabel, QPushButton, QVBoxLayout, QLineEdit, QGridLayout, QProgressBar, QTableView
 
 from electrum import util, keystore, ecc, crypto
 from electrum.network import Network
 from electrum import transaction
+from electrum.gui.qt.address_list import AddressList
 from electrum.plugin import BasePlugin, hook
 from electrum.i18n import _
 from electrum.wallet import Multisig_Wallet
@@ -43,12 +45,22 @@ from electrum.wallet import Multisig_Wallet
 #                  make_aiohttp_session, resource_path)
 
 from electrum.gui.qt.transaction_dialog import show_transaction
-from electrum.gui.qt.util import WaitingDialog, WindowModalDialog, get_parent_main_window, line_dialog, text_dialog, EnterButton, Buttons, CloseButton, OkButton
+from electrum.gui.qt.util import WaitingDialog, WindowModalDialog, get_parent_main_window, line_dialog, text_dialog, EnterButton, Buttons, CloseButton, OkButton, HelpLabel, read_QIcon, CancelButton
+from electrum.gui.qt.main_window import StatusBarButton
 from functools import partial
 
 import sys
 import os
 from .omni import OmniCoreRPC
+
+
+from PyQt5.QtCore import Qt, QPersistentModelIndex, QModelIndex
+from PyQt5.QtGui import QStandardItemModel, QStandardItem, QFont
+from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QLabel, QMenu
+
+from enum import IntEnum
+
+from electrum.gui.qt.util import MyTreeView, MONOSPACE_FONT, ColorScheme
 
 #TODO: set up logger for plugin output
 
@@ -71,11 +83,12 @@ class Plugin(BasePlugin):
         self.node_url = self.config.get('omni_node')
         self.node_user = self.config.get('omni_user')
         self.node_pass = self.config.get('omni_pass')
+        self._cache = {}
 
         if self.node_url and self.node_user and self.node_pass:
-            self.node = OmniCoreRPC(url=self.node_url, username=self.node_user, password=self.node_pass)
+            self._node = OmniCoreRPC(url=self.node_url, username=self.node_user, password=self.node_pass)
         else:
-            self.node = None
+            self._node = None
 
     def requires_settings(self):
         return True
@@ -118,23 +131,48 @@ class Plugin(BasePlugin):
             if out.type == 2:
                 OP_RETURN = str(out.address)
                 if len(OP_RETURN) == 44:
-                    LAYER = OP_RETURN[0:12]
+                    LAYER = ""
                     VERSION = OP_RETURN[12:16]
-                    ASSET = OP_RETURN[16:28]
+                    ASSET = 0
+                    try:
+                        LAYER = codecs.decode(OP_RETURN[4:12], 'hex').decode('utf-8')
+                    except:
+                        logging.debug('exception while converting OP_RETURN field to decimal {}'.format(OP_RETURN[28:44]))
+                        LAYER = "none"
                     try:
                         AMT = int(OP_RETURN[28:44], 16)
                     except:
                         logging.debug('exception while converting OP_RETURN field to decimal {}'.format(OP_RETURN[28:44]))
                         AMT = 0
+                    try:
+                        ASSET = int(OP_RETURN[16:28], 16)
+                    except:
+                        logging.debug('exception while converting OP_RETURN field to decimal {}'.format(OP_RETURN[28:44]))
+                        ASSET = 0
                     # Tether Omni Layer condition
-                    if LAYER == '6a146f6d6e69' and ASSET == '00000000001f':
+                    if LAYER == 'omni' and ASSET == 32:
                         logging.debug("found OMNI encoded OP_RETURN transcation {} amt {} USD".format(tx.txid(), AMT / 100000000))
         if AMT != -1:
-            return [AMT / 100000000, "USDT"]
+            return {'layer': LAYER, 'asset': ASSET, 'value': AMT / 100000000 }
         else:
-            return []
+            return {}
 
-
+    @hook
+    def load_wallet(self, wallet, window):
+        self.wallet = wallet
+        #if self._cache.keys() != self.wallet.get_addresses() and False:
+        #    self.update_omni_cache()
+    '''
+    def update_omni_cache(self):
+        for a in self.wallet.get_addresses():
+            if self._node:
+                self._cache[a] = []
+                response = self._node.make_async_call(method='omni_getallbalancesforaddress', params=[a])
+                if response and 'result' in response:
+                    for asset_balance in response['result']:
+                        self._cache[a].append(dict(asset_balance))
+                        logging.debug('{} asset {} balance cached'.format(a, asset_balance['propertyid'] ))
+    '''
     @hook
     def transaction_dialog(self, d):
         if self.get_omni_info(d.tx) != []:
@@ -152,21 +190,95 @@ class Plugin(BasePlugin):
             d.omni_view_button.hide()
         return
 
-    def validate_omni(self, tx):
+    @hook
+    def create_send_tab(self, d):
+        msg = _('Recipient of the funds.') + '\n\n'\
+              + _('You may enter a Bitcoin address, a label from your list of contacts (a list of completions will be proposed), or an alias (email-like address that forwards to a Bitcoin address)')
+        payto_label = HelpLabel(_('Pay to omni'), msg)
+        d.addWidget(payto_label, 1, 0)
+        pass
+
+    @hook
+    def create_status_bar(self, parent):
+        self.status_button = StatusBarButton(read_QIcon("omnilogo.png"), _("Omni"), lambda: self.show_omni_wallet_status(parent))
+        parent.addPermanentWidget(self.status_button)
+
+    def show_omni_wallet_status(self, window):
+        d = WindowModalDialog(window, _("Omni Wallet Status"))
+        vbox = QVBoxLayout(d)
+
+        addresses = self.wallet.get_addresses()
+
+        view = QTableView()
+        table = AddressTableModel()
+        view.setModel(table)
+        vbox.addWidget(view)
+
+        pb = QProgressBar()
+        pb.setMaximum(len(addresses))
+        pb.setMinimum(0)
+        vbox.addWidget(pb)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel(_("Status")), 1, 0)
+        status_label = QLabel(_("starting..."))
+        status_label.setFixedWidth(280)
+        grid.addWidget(status_label, 1, 1)
+
+        vbox.addLayout(grid)
+        vbox.addLayout(Buttons(CancelButton(d), OkButton(d)))
+
+        loop = asyncio.get_event_loop()
+        thread = OmniNodeRequestTread(addresses, self._node, self._cache, loop, table)
+        thread.pbar_signal.connect(pb.setValue)
+        thread.pbar_signal_str.connect(status_label.setText)
+        if not thread.isRunning():
+            thread.start()
+        if d.exec_():
+            print("Exec!")
+
+
+    def validate_omni(self, txid):
         '''
         queries omni node to get external knowledge of the tx state in omni layer
         :param tx: original bitcoin transaction
         :return: status, if validated or not
         '''
-        pass
+        if self._node:
+            result = self._node.make_async_call(method='omni_gettransaction', params=[txid])
+            if 'result' in result and 'valid' in result['result']:
+                temp = result['result']
+                return {'valid': temp['valid'],
+                        'sendingaddress': temp['sendingaddress'],
+                        'referenceaddress': temp['referenceaddress']}
+        return None
+
 
     def view_omni_tx_dialog(self, parent, tx):
         info = self.get_omni_info(tx)
-        parent.show_message(''.join(["<b>",_("Verified"), ": </b>", _(str(False)), "<br/>",
-                                     "<b>", _("Amount"), ": </b> ", _(str(info[0])), "<br/>",
-                                     "<b>", _("Asset"), ": </b> ", _(str(info[1]))
-                                     ]),
-                            rich_text=True)
+        if set(['layer', 'asset', 'value']) <= set(info.keys()):
+            valid_dict = self.validate_omni(tx.txid())
+            sender = None
+            receiver = None
+            verified = False
+            if valid_dict:
+                receiver = valid_dict['referenceaddress']
+                sender = valid_dict['sendingaddress']
+                verified = bool(valid_dict['valid'])
+            asset_str = str(info['asset'])
+            if info['asset'] == 31:
+                asset_str = "USDT"
+            amount_str = str("{:.8f}".format(info['value']))
+            parent.show_message(''.join(["<b>",_("Layer"), ": </b>", _(info['layer']), "<br/>",
+                                         "<b>", _("Asset"), ": </b> ", _(asset_str), "<br/>",
+                                         "<b>", _("Amount"), ": </b> ", _(amount_str), "<br/>",
+                                         "<b>", _("Verified"), ": </b>", _(str(verified)), "<br/>",
+                                         "<b>", _("Sender"), ": </b>", _(str(sender)), "<br/>",
+                                         "<b>", _("Recepient"), ": </b>", _(str(receiver)), "<br/>"
+                                         ]),
+                                rich_text=True)
+        else:
+            parent.show_message(''.join(["<b>",_("No omni info"),"</b>"]), rich_text=True)
 
         """
         d = WindowModalDialog(self, "Omni Transaction Dialog")
@@ -253,11 +365,11 @@ class Plugin(BasePlugin):
         CheckNodeButton = QPushButton(_("Check"))
         def check_handler():
             status = {}
-            if self.node:
-                status = self.node.check()
+            if self._node:
+                status = self._node.check()
             else:
-                self.node = OmniCoreRPC(url=self.node_url, username=self.node_user, password=self.node_pass)
-                status = self.node.check()
+                self._node = OmniCoreRPC(url=self.node_url, username=self.node_user, password=self.node_pass)
+                status = self._node.check()
             if 'error' not in status:
                 d.show_message("Node is ok!")
             elif 'error' in status:
@@ -277,7 +389,10 @@ class Plugin(BasePlugin):
             self.config.set_key('omni_user', self.node_user)
             self.node_pass = str(pass_field.text())
             self.config.set_key('omni_pass', self.node_pass)
-            status = self.node.reset(url=self.node_url, username=self.node_user, password=self.node_pass)
+            if self.wallet:
+                self.wallet.syncronize()
+                self.wallet.config.save_last_wallet()
+            status = self._node.reset(url=self.node_url, username=self.node_user, password=self.node_pass)
 
         SaveButton.clicked.connect(save_handler)
 
@@ -287,3 +402,135 @@ class Plugin(BasePlugin):
 
         if not d.exec_():
             return
+
+class OmniNodeRequestTread(QThread):
+    pbar_signal = pyqtSignal(int)
+    pbar_signal_str = pyqtSignal(str)
+    def __init__(self, search_list, node, cache, loop, table):
+        super(OmniNodeRequestTread, self).__init__()
+        self.addresses = search_list
+        self._node = node
+        self._cache = cache
+        self._loop = loop
+        self._gui_obj = table
+
+    def run(self):
+        import time
+        #for time measurement
+        t = time.time()
+        counter = 0
+        for a in self.addresses:
+            if self._node:
+                self._cache[a] = []
+                self.pbar_signal_str.emit(a)
+                counter += 1
+                response = self._node.make_async_call(method='omni_getallbalancesforaddress', params=[a], loop = self._loop)
+                if response and 'result' in response:
+                    for asset_balance in response['result']:
+                        self._cache[a].append(dict(asset_balance))
+                        logging.debug('{} asset {} balance cached'.format(a, asset_balance['propertyid']))
+                        self._gui_obj.addAddress(Address(a, asset_balance['balance'], asset_balance['propertyid']))
+            self.pbar_signal.emit(counter)
+        self.pbar_signal_str.emit('completed')
+        #measuring task time
+        logging.debug("balances obtained. Task start {}, task end {}".format(time.time(), t))
+
+
+class Address(object):
+    """Name of the person along with his city"""
+    def __init__(self, a, balance, asset):
+        self.a = a
+        self.balance = balance
+        self.asset = asset
+
+class AddressTableModel(QAbstractTableModel):
+
+    def __init__(self):
+        super(AddressTableModel, self).__init__()
+        self.headers = ['Address', 'Asset', 'Balance']
+        self.addresses = []
+
+    def rowCount(self, index=QModelIndex()):
+        return len(self.addresses)
+
+    def addAddress(self, address):
+        self.beginResetModel()
+        self.addresses.append(address)
+        self.endResetModel()
+
+    def columnCount(self, index=QModelIndex()):
+        return len(self.headers)
+
+    def data(self, index, role=Qt.DisplayRole):
+        col = index.column()
+        address = self.addresses[index.row()]
+        if role == Qt.DisplayRole:
+            if col == 0:
+                return QVariant(address.a)
+            elif col == 1:
+                return QVariant(address.asset)
+            elif col == 2:
+                return QVariant(address.balance)
+            return QVariant()
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return QVariant()
+
+        if orientation == Qt.Horizontal:
+            return QVariant(self.headers[section])
+        return QVariant(int(section + 1))
+
+
+
+
+
+''' 
+class UpdateCheckThread(QThread, PrintError):
+    checked = pyqtSignal(object)
+    failed = pyqtSignal()
+
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+
+    async def get_update_info(self):
+        async with make_aiohttp_session(proxy=self.main_window.network.proxy) as session:
+            async with session.get(UpdateCheck.url) as result:
+                signed_version_dict = await result.json(content_type=None)
+                # example signed_version_dict:
+                # {
+                #     "version": "3.9.9",
+                #     "signatures": {
+                #         "1Lqm1HphuhxKZQEawzPse8gJtgjm9kUKT4": "IA+2QG3xPRn4HAIFdpu9eeaCYC7S5wS/sDxn54LJx6BdUTBpse3ibtfq8C43M7M1VfpGkD5tsdwl5C6IfpZD/gQ="
+                #     }
+                # }
+                version_num = signed_version_dict['version']
+                sigs = signed_version_dict['signatures']
+                for address, sig in sigs.items():
+                    if address not in UpdateCheck.VERSION_ANNOUNCEMENT_SIGNING_KEYS:
+                        continue
+                    sig = base64.b64decode(sig)
+                    msg = version_num.encode('utf-8')
+                    if ecc.verify_message_with_address(address=address, sig65=sig, message=msg,
+                                                       net=constants.BitcoinMainnet):
+                        self.print_error(f"valid sig for version announcement '{version_num}' from address '{address}'")
+                        break
+                else:
+                    raise Exception('no valid signature for version announcement')
+                return StrictVersion(version_num.strip())
+    
+    def run(self):
+        network = self.main_window.network
+        if not network:
+            self.failed.emit()
+            return
+        try:
+            update_info = asyncio.run_coroutine_threadsafe(self.get_update_info(), network.asyncio_loop).result()
+        except Exception as e:
+            #self.print_error(traceback.format_exc())
+            self.print_error(f"got exception: '{repr(e)}'")
+            self.failed.emit()
+        else:
+            self.checked.emit(update_info)
+'''
