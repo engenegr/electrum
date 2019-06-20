@@ -23,52 +23,40 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
 import asyncio
-import aiohttp
 import logging
-import concurrent
 import codecs
-from xmlrpc.client import ServerProxy
 
-from PyQt5.QtCore import QRegExp, QObject, QThread, pyqtSignal, QAbstractTableModel, QVariant
-from PyQt5.QtGui import QRegExpValidator
-from PyQt5.QtWidgets import QLabel, QPushButton, QVBoxLayout, QLineEdit, QGridLayout, QProgressBar, QTableView
+from PyQt5.QtCore import QThread, pyqtSignal, QAbstractTableModel, QVariant
+from PyQt5.QtWidgets import QPushButton, QVBoxLayout, QLineEdit, QGridLayout, QProgressBar, QTableView, QHeaderView, QApplication
 
-from electrum import util, keystore, ecc, crypto
 from electrum.network import Network
-from electrum import transaction
-from electrum.gui.qt.address_list import AddressList
+from electrum.transaction import TxOutput
 from electrum.plugin import BasePlugin, hook
 from electrum.i18n import _
-from electrum.wallet import Multisig_Wallet
-#from electrum.util import (ThreadJob, make_dir, log_exceptions,
-#                  make_aiohttp_session, resource_path)
 
-from electrum.gui.qt.transaction_dialog import show_transaction
-from electrum.gui.qt.util import WaitingDialog, WindowModalDialog, get_parent_main_window, line_dialog, text_dialog, EnterButton, Buttons, CloseButton, OkButton, HelpLabel, read_QIcon, CancelButton
+from electrum.gui.qt.util import WindowModalDialog, get_parent_main_window, EnterButton, Buttons, CloseButton, OkButton, read_QIcon, CancelButton
 from electrum.gui.qt.main_window import StatusBarButton
+from electrum.bitcoin import is_address, TYPE_SCRIPT, TYPE_ADDRESS, dust_threshold
 from functools import partial
 
-import sys
-import os
 from .omni import OmniCoreRPC
 
+from PyQt5.QtCore import Qt, QModelIndex
+from PyQt5.QtWidgets import QLabel, QMenu
 
-from PyQt5.QtCore import Qt, QPersistentModelIndex, QModelIndex
-from PyQt5.QtGui import QStandardItemModel, QStandardItem, QFont
-from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QLabel, QMenu
-
-from enum import IntEnum
-
-from electrum.gui.qt.util import MyTreeView, MONOSPACE_FONT, ColorScheme
+#errors
+from electrum.util import NotEnoughFunds, NoDynamicFeeEstimates
+from electrum.wallet import InternalAddressCorruption
 
 #TODO: set up logger for plugin output
-
 
 class Plugin(BasePlugin):
 
     def __init__(self, parent, config, name):
-        BasePlugin.__init__(self, parent, config, name)
+        super().__init__(parent, config, name)
+        self.parent = parent
         self.omni_assets_codes = []
 
         self.base_dir = os.path.join(config.electrum_path(), 'omniviewer')
@@ -90,6 +78,7 @@ class Plugin(BasePlugin):
         else:
             self._node = None
 
+        self.prepared_tx = ''
     def requires_settings(self):
         return True
 
@@ -119,11 +108,8 @@ class Plugin(BasePlugin):
         return True
 
     def update(self, window):
-        pass
-        #wallet = window.wallet
         #TODO: limit types of wallets plugin can work with
-        #if type(wallet) != Multisig_Wallet:
-        #    return
+        pass
 
     def get_omni_info(self, tx):
         AMT = -1
@@ -160,19 +146,7 @@ class Plugin(BasePlugin):
     @hook
     def load_wallet(self, wallet, window):
         self.wallet = wallet
-        #if self._cache.keys() != self.wallet.get_addresses() and False:
-        #    self.update_omni_cache()
-    '''
-    def update_omni_cache(self):
-        for a in self.wallet.get_addresses():
-            if self._node:
-                self._cache[a] = []
-                response = self._node.make_async_call(method='omni_getallbalancesforaddress', params=[a])
-                if response and 'result' in response:
-                    for asset_balance in response['result']:
-                        self._cache[a].append(dict(asset_balance))
-                        logging.debug('{} asset {} balance cached'.format(a, asset_balance['propertyid'] ))
-    '''
+
     @hook
     def transaction_dialog(self, d):
         if self.get_omni_info(d.tx) != []:
@@ -191,28 +165,30 @@ class Plugin(BasePlugin):
         return
 
     @hook
-    def create_send_tab(self, d):
-        msg = _('Recipient of the funds.') + '\n\n'\
-              + _('You may enter a Bitcoin address, a label from your list of contacts (a list of completions will be proposed), or an alias (email-like address that forwards to a Bitcoin address)')
-        payto_label = HelpLabel(_('Pay to omni'), msg)
-        d.addWidget(payto_label, 1, 0)
-        pass
-
-    @hook
     def create_status_bar(self, parent):
         self.status_button = StatusBarButton(read_QIcon("omnilogo.png"), _("Omni"), lambda: self.show_omni_wallet_status(parent))
         parent.addPermanentWidget(self.status_button)
 
     def show_omni_wallet_status(self, window):
         d = WindowModalDialog(window, _("Omni Wallet Status"))
+
         vbox = QVBoxLayout(d)
 
         addresses = self.wallet.get_addresses()
 
-        view = QTableView()
+        self.table_view = QTableView()
+
+        self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_view.customContextMenuRequested.connect(partial(self.create_menu, window))
         table = AddressTableModel()
-        view.setModel(table)
-        vbox.addWidget(view)
+        self.table_view.setModel(table)
+
+        self.table_view.setFixedWidth(500)
+        header = self.table_view.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        vbox.addWidget(self.table_view)
 
         pb = QProgressBar()
         pb.setMaximum(len(addresses))
@@ -229,13 +205,13 @@ class Plugin(BasePlugin):
         vbox.addLayout(Buttons(CancelButton(d), OkButton(d)))
 
         loop = asyncio.get_event_loop()
-        thread = OmniNodeRequestTread(addresses, self._node, self._cache, loop, table)
+        thread = OmniNodeRequestTread(addresses, self._node, self.wallet, self._cache, loop, table)
         thread.pbar_signal.connect(pb.setValue)
         thread.pbar_signal_str.connect(status_label.setText)
         if not thread.isRunning():
             thread.start()
         if d.exec_():
-            print("Exec!")
+            return
 
 
     def validate_omni(self, txid):
@@ -244,13 +220,17 @@ class Plugin(BasePlugin):
         :param tx: original bitcoin transaction
         :return: status, if validated or not
         '''
+        tx_info = self.wallet.get_tx_height(txid)
+        if tx_info.height == 0:
+            return None
         if self._node:
-            result = self._node.make_async_call(method='omni_gettransaction', params=[txid])
-            if 'result' in result and 'valid' in result['result']:
-                temp = result['result']
-                return {'valid': temp['valid'],
-                        'sendingaddress': temp['sendingaddress'],
-                        'referenceaddress': temp['referenceaddress']}
+            response = self._node.make_async_call(method='omni_gettransaction', params=[txid])
+            if response:
+                if 'result' in response and 'valid' in response['result']:
+                    temp = response['result']
+                    return {'valid': temp['valid'],
+                            'sendingaddress': temp['sendingaddress'],
+                            'referenceaddress': temp['referenceaddress']}
         return None
 
 
@@ -280,53 +260,7 @@ class Plugin(BasePlugin):
         else:
             parent.show_message(''.join(["<b>",_("No omni info"),"</b>"]), rich_text=True)
 
-        """
-        d = WindowModalDialog(self, "Omni Transaction Dialog")
-        d.setMinimumWidth(500)
-        d.setMinimumHeight(210)
-        d.setMaximumHeight(450)
-        d.setContentsMargins(11, 11, 1, 1)
-        self.c_dialog = d
 
-        vbox = QVBoxLayout()
-        vbox.addWidget(QLabel(_("Transaction ID:")))
-        window.exec_layout(vbox, next_enabled=False, raise_on_cancel=False)
-        return bool(d.exec_())
-        """
-
-    '''
-    def cosigner_can_sign(self, tx, cosigner_xpub):
-        from electrum.keystore import is_xpubkey, parse_xpubkey
-        xpub_set = set([])
-        for txin in tx.inputs():
-            for x_pubkey in txin['x_pubkeys']:
-                if is_xpubkey(x_pubkey):
-                    xpub, s = parse_xpubkey(x_pubkey)
-                    xpub_set.add(xpub)
-        return cosigner_xpub in xpub_set
-    
-    def do_send(self, tx):
-        def on_success(result):
-            window.show_message(_("Your transaction was sent to the cosigning pool.") + '\n' +
-                                _("Open your cosigner wallet to retrieve it."))
-        def on_failure(exc_info):
-            e = exc_info[1]
-            try: self.logger.error("on_failure", exc_info=exc_info)
-            except OSError: pass
-            window.show_error(_("Failed to send transaction to cosigning pool") + ':\n' + str(e))
-
-        for window, xpub, K, _hash in self.cosigner_list:
-            if not self.cosigner_can_sign(tx, xpub):
-                continue
-            # construct message
-            raw_tx_bytes = bfh(str(tx))
-            public_key = ecc.ECPubkey(K)
-            message = public_key.encrypt_message(raw_tx_bytes).decode('ascii')
-            # send message
-            task = lambda: server.put(_hash, message)
-            msg = _('Sending transaction to cosigning pool...')
-            WaitingDialog(window, msg, task, on_success, on_failure)
-        '''
     def node_settings_dialog(self, window):
 
         d = WindowModalDialog(window, _("Omni Plugin - Trusted Node Settings"))
@@ -403,13 +337,171 @@ class Plugin(BasePlugin):
         if not d.exec_():
             return
 
+    def create_menu(self, parent, position):
+        items = self.table_view.selectionModel().selectedIndexes()
+        selected = list(x for x in items if x.column() == 0)
+        if not selected or len(selected) > 1:
+            return
+        addrs = [self.table_view.model().data(item) for item in selected]
+        menu = QMenu(parent)
+        idx = self.table_view.indexAt(position)
+        col = idx.column()
+        column_title = self.table_view.model().headers[col]
+        menu.addAction(_("Copy {}").format(column_title), lambda: self.place_text_on_clipboard(copy_text))
+        copy_text =  self.table_view.model().data(idx)
+        asset_info = self.table_view.model().getRowAsDict(idx)
+        coins = self.wallet.get_addr_utxo(addrs[0])
+        if coins:
+            menu.addAction(_("Spend from"), lambda: self.spend_coins(parent, addrs[0], asset_info['asset'], asset_info['balance'] ))
+
+        menu.exec_(self.table_view.viewport().mapToGlobal(position))
+
+    def place_text_on_clipboard(self, text):
+        if is_address(text):
+            try:
+                self.wallet.check_address(text)
+            except InternalAddressCorruption as e:
+                self.parent.show_error(str(e))
+                raise
+        qApp = QApplication.instance()
+        qApp.clipboard().setText(text)
+
+    def spend_coins(self, parent, address, asset, balance):
+        coins = self.wallet.get_addr_utxo(address)
+        d = WindowModalDialog(parent, _("Send Omni to Address"))
+        d.setMinimumSize(100, 200)
+
+        vbox = QVBoxLayout(d)
+
+        vbox.addWidget(QLabel(_('Asset {}'.format(asset))))
+        grid = QGridLayout()
+        vbox.addLayout(grid)
+
+        grid.addWidget(QLabel(_('Recepient')), 0, 0)
+        recepient_field = QLineEdit()
+        recepient_field.setText("")
+        grid.addWidget(recepient_field, 0, 1)
+
+        grid.addWidget(QLabel(_('Amount')), 1, 0)
+        amount_field = QLineEdit()
+        amount_field.setText(str(balance))
+        grid.addWidget(amount_field, 1, 1)
+
+        grid.addWidget(QLabel(_('Send onchain (sats)')), 2, 0)
+        sats_field = QLineEdit()
+        sats_field.setFixedWidth(280)
+        sats_field.setText(str(dust_threshold()))
+        grid.addWidget(sats_field, 2, 1 )
+
+        FEERATE = 2
+
+        grid.addWidget(QLabel(_('Fee (sat/vbyte)')), 3, 0)
+        fee_field = QLineEdit()
+        fee_field.setText(str(FEERATE))
+        grid.addWidget(fee_field, 3, 1 )
+
+        CheckTxButton = QPushButton(_("Check"))
+
+        def check_handler(coins):
+            recepient = str(recepient_field.text())
+            try:
+                amount = int(float(amount_field.text())*100000000)
+            except:
+                main_window = get_parent_main_window(parent)
+                main_window.show_error("Coins amount must be numeric!")
+                return
+            try:
+                onchain = int(sats_field.text())
+            except:
+                main_window = get_parent_main_window(parent)
+                main_window.show_error("Sats amount must be integer!")
+                return
+            values = [item['value'] for item in coins.values()]
+            maximum = max(values)
+            idx = values.index(maximum)
+            key_max = list(coins.keys())[idx]
+            if not is_address(recepient):
+                main_window = get_parent_main_window(parent)
+                main_window.show_error("Non-valid destination address!")
+                return
+            if maximum < onchain + 1000:
+                main_window = get_parent_main_window(parent)
+                main_window.show_error("Not enough sats to send Omni!")
+                return
+            else:
+                #coins = { key_max: coins[key_max] }
+                asset_str = "%0.12x" % asset
+                amount_str = "%0.16x" % amount
+                opreturn_str = "OP_RETURN {}{}{}{}, 0 \n {}, {:d}".format('6f6d6e69', '0000', asset_str, amount_str, recepient, onchain )
+                main_window = get_parent_main_window(parent)
+                main_window.show_warning(opreturn_str)
+                return
+
+        CheckTxButton.clicked.connect(partial(check_handler, coins))
+
+        ContinueButton = OkButton(d, label="Continue")
+        def continue_handler():
+            recepient = str(recepient_field.text())
+            amount = int(float(amount_field.text()) * 100000000)
+            onchain = int(sats_field.text())
+            feerate = int(fee_field.text())
+            opcode = '6a14'
+            layer_hex = '6f6d6e69'
+            amount_hex = '{0:0{1}X}'.format(amount,16)
+            asset_hex = '{0:0{1}X}'.format(asset,12)
+            omni_data = '{}{}{}{}{}'.format(opcode, layer_hex, "0000", asset_hex, amount_hex)
+            #'6f6d6e69000000000000001f000000001dcd6500' # OP_RETURN  get_address_from_output_script(bfh(
+            outputs = []
+            outputs.append(TxOutput(TYPE_SCRIPT, omni_data, 0))
+            outputs.append(TxOutput(TYPE_ADDRESS, recepient, onchain))
+            network = Network.get_instance()
+            fee_estimator = partial(network.config.estimate_fee_for_feerate, feerate*1000)
+            coins = self.wallet.get_spendable_coins(domain=[address], config=network.config)
+            coins.sort(key=lambda x: x['value'], reverse=False)
+            spend_coin = None
+            for c in coins:
+                if c['value'] >= onchain + dust_threshold():
+                    spend_coin = c
+                    break
+            try:
+                btc_tx = self.wallet.make_unsigned_transaction([spend_coin], outputs, network.config,
+                                                               fixed_fee=fee_estimator,
+                                                               change_addr=address,
+                                                               is_sweep=False)
+                main_window = get_parent_main_window(parent)
+                from electrum.gui.qt.transaction_dialog import show_transaction
+                show_transaction(btc_tx, main_window, desc=None, prompt_if_unsaved=False)
+                return
+            except NotEnoughFunds as e:
+                msg = "Not enough funds onchain. Send some bitcoins to {}".format(address)
+            except NoDynamicFeeEstimates as e:
+                msg = "Fee estimation error."
+            except InternalAddressCorruption as e:
+                msg = "Invalid address."
+            except BaseException as e:
+                msg = "Non-related to the wallet error {}".format(str(e))
+            main_window = get_parent_main_window(parent)
+            main_window.show_error(msg)
+            return
+
+        ContinueButton.clicked.connect(continue_handler)
+
+        vbox.addStretch()
+        vbox.addSpacing(13)
+        vbox.addLayout(Buttons(CloseButton(d), CheckTxButton, ContinueButton))
+
+        if not d.exec_():
+            return
+
+
 class OmniNodeRequestTread(QThread):
     pbar_signal = pyqtSignal(int)
     pbar_signal_str = pyqtSignal(str)
-    def __init__(self, search_list, node, cache, loop, table):
+    def __init__(self, search_list, node, wallet, cache, loop, table):
         super(OmniNodeRequestTread, self).__init__()
         self.addresses = search_list
         self._node = node
+        self._wallet = wallet
         self._cache = cache
         self._loop = loop
         self._gui_obj = table
@@ -429,7 +521,8 @@ class OmniNodeRequestTread(QThread):
                     for asset_balance in response['result']:
                         self._cache[a].append(dict(asset_balance))
                         logging.debug('{} asset {} balance cached'.format(a, asset_balance['propertyid']))
-                        self._gui_obj.addAddress(Address(a, asset_balance['balance'], asset_balance['propertyid']))
+                        utxo_list = self._wallet.get_addr_utxo(a)
+                        self._gui_obj.addAddress(Address(a, asset_balance['balance'], asset_balance['propertyid'], utxo_list))
             self.pbar_signal.emit(counter)
         self.pbar_signal_str.emit('completed')
         #measuring task time
@@ -438,16 +531,17 @@ class OmniNodeRequestTread(QThread):
 
 class Address(object):
     """Name of the person along with his city"""
-    def __init__(self, a, balance, asset):
+    def __init__(self, a, balance, asset, utxo_list):
         self.a = a
         self.balance = balance
         self.asset = asset
+        self.utxo = str(len(utxo_list))
 
 class AddressTableModel(QAbstractTableModel):
 
     def __init__(self):
         super(AddressTableModel, self).__init__()
-        self.headers = ['Address', 'Asset', 'Balance']
+        self.headers = ['Address', 'Asset', 'Balance', 'UTXOs']
         self.addresses = []
 
     def rowCount(self, index=QModelIndex()):
@@ -466,71 +560,22 @@ class AddressTableModel(QAbstractTableModel):
         address = self.addresses[index.row()]
         if role == Qt.DisplayRole:
             if col == 0:
-                return QVariant(address.a)
+                return str(address.a)
             elif col == 1:
-                return QVariant(address.asset)
+                return str(address.asset)
             elif col == 2:
-                return QVariant(address.balance)
-            return QVariant()
+                return str(address.balance)
+            elif col == 3:
+                return str(address.utxo)
+            return str("")
+
+    def getRowAsDict(self, index):
+        address = self.addresses[index.row()]
+        return {'asset': address.asset, 'balance': address.balance}
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if role != Qt.DisplayRole:
             return QVariant()
-
         if orientation == Qt.Horizontal:
             return QVariant(self.headers[section])
         return QVariant(int(section + 1))
-
-
-
-
-
-''' 
-class UpdateCheckThread(QThread, PrintError):
-    checked = pyqtSignal(object)
-    failed = pyqtSignal()
-
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-
-    async def get_update_info(self):
-        async with make_aiohttp_session(proxy=self.main_window.network.proxy) as session:
-            async with session.get(UpdateCheck.url) as result:
-                signed_version_dict = await result.json(content_type=None)
-                # example signed_version_dict:
-                # {
-                #     "version": "3.9.9",
-                #     "signatures": {
-                #         "1Lqm1HphuhxKZQEawzPse8gJtgjm9kUKT4": "IA+2QG3xPRn4HAIFdpu9eeaCYC7S5wS/sDxn54LJx6BdUTBpse3ibtfq8C43M7M1VfpGkD5tsdwl5C6IfpZD/gQ="
-                #     }
-                # }
-                version_num = signed_version_dict['version']
-                sigs = signed_version_dict['signatures']
-                for address, sig in sigs.items():
-                    if address not in UpdateCheck.VERSION_ANNOUNCEMENT_SIGNING_KEYS:
-                        continue
-                    sig = base64.b64decode(sig)
-                    msg = version_num.encode('utf-8')
-                    if ecc.verify_message_with_address(address=address, sig65=sig, message=msg,
-                                                       net=constants.BitcoinMainnet):
-                        self.print_error(f"valid sig for version announcement '{version_num}' from address '{address}'")
-                        break
-                else:
-                    raise Exception('no valid signature for version announcement')
-                return StrictVersion(version_num.strip())
-    
-    def run(self):
-        network = self.main_window.network
-        if not network:
-            self.failed.emit()
-            return
-        try:
-            update_info = asyncio.run_coroutine_threadsafe(self.get_update_info(), network.asyncio_loop).result()
-        except Exception as e:
-            #self.print_error(traceback.format_exc())
-            self.print_error(f"got exception: '{repr(e)}'")
-            self.failed.emit()
-        else:
-            self.checked.emit(update_info)
-'''

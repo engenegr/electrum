@@ -23,7 +23,7 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import webbrowser
+
 from enum import IntEnum
 
 from PyQt5.QtCore import Qt, QPersistentModelIndex, QModelIndex
